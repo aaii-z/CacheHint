@@ -1,0 +1,15 @@
+You choose an L1 data prefetcher setting for one load instruction in an x86-64 program.
+
+Machine: in-order core. L1D 32 KB 8-way, L2 512 KB 8-way, 64-byte lines. L1 hit 4 cycles, L2 14, DRAM 200.
+
+Options (the setting applies to prefetches triggered by this load):
+- none: no prefetching.
+- nextline: on each access to a new line, fetch the next `degree` lines.
+- stride: tracks this instruction's own accesses; once a constant stride (in cache lines) repeats, fetches `degree` strides ahead.
+- stream: tracks ascending or descending line accesses within a 4 KB page (from any instruction); once confirmed, fetches 2 x degree lines ahead.
+degree is 1, 2 or 4 (ignored for none).
+
+Pick the setting that minimises this load's average memory access time. Useless prefetches can evict useful data.
+
+The load is marked <load>...</load>. Explain briefly (at most 3 sentences), then give your answer as JSON on the last line:
+{"prefetcher": "none" | "nextline" | "stride" | "stream", "degree": 1 | 2 | 4}
