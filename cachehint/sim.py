@@ -25,25 +25,25 @@ class Cache:
     def contains(self, line: int) -> bool:
         return line in self.sets[line % self.nsets]
 
-    def touch(self, line: int) -> bool:
-        """Lookup; on hit, move to MRU."""
+    def touch(self, line: int, promote: bool = True) -> bool:
+        """Lookup; on hit, move to MRU unless promote is False."""
         s = self.sets[line % self.nsets]
         if line in s:
-            if s[-1] != line:
+            if promote and s[-1] != line:
                 s.remove(line)
                 s.append(line)
             return True
         return False
 
-    def insert(self, line: int):
-        """Insert as MRU; return evicted line or None."""
+    def insert(self, line: int, lru: bool = False):
+        """Insert as MRU (or LRU); return evicted line or None."""
         s = self.sets[line % self.nsets]
         if line in s:
             s.remove(line)
-            s.append(line)
+            s.insert(0, line) if lru else s.append(line)
             return None
         victim = s.pop(0) if len(s) >= self.ways else None
-        s.append(line)
+        s.insert(0, line) if lru else s.append(line)
         return victim
 
 
@@ -55,7 +55,7 @@ class NoPrefetcher:
     def __init__(self, degree: int = 0):
         self.degree = 0
 
-    def train(self, pc: int, addr: int, line: int) -> list[int]:
+    def train(self, pc: int, addr: int, line: int, degree: int | None = None) -> list[int]:
         return []
 
 
@@ -68,11 +68,11 @@ class NextLine:
         self.degree = degree
         self.last_line = -1
 
-    def train(self, pc, addr, line):
+    def train(self, pc, addr, line, degree=None):
         if line == self.last_line:
             return []
         self.last_line = line
-        return [line + k for k in range(1, self.degree + 1)]
+        return [line + k for k in range(1, (degree or self.degree) + 1)]
 
 
 class IPStride:
@@ -85,7 +85,7 @@ class IPStride:
         self.degree = degree
         self.table: OrderedDict[int, list[int]] = OrderedDict()  # pc -> [last_line, stride, conf]
 
-    def train(self, pc, addr, line):
+    def train(self, pc, addr, line, degree=None):
         e = self.table.get(pc)
         if e is None:
             if len(self.table) >= self.TABLE_SIZE:
@@ -104,7 +104,7 @@ class IPStride:
                 e[1] = stride
         e[0] = line
         if e[2] >= 2:
-            return [line + e[1] * k for k in range(1, self.degree + 1)]
+            return [line + e[1] * k for k in range(1, (degree or self.degree) + 1)]
         return []
 
 
@@ -119,7 +119,7 @@ class Stream:
         self.degree = degree
         self.table: OrderedDict[int, list[int]] = OrderedDict()  # page -> [last_line, dir, conf]
 
-    def train(self, pc, addr, line):
+    def train(self, pc, addr, line, degree=None):
         page = line // self.PAGE_LINES
         e = self.table.get(page)
         if e is None:
@@ -148,7 +148,7 @@ class Stream:
             if e[2] < 2:
                 return []
         d = e[1]
-        return [line + d * k for k in range(1, 2 * self.degree + 1)]
+        return [line + d * k for k in range(1, 2 * (degree or self.degree) + 1)]
 
 
 PREFETCHERS = {"none": NoPrefetcher, "nextline": NextLine, "stride": IPStride, "stream": Stream}
@@ -163,37 +163,78 @@ def config_name(pf: str, degree: int) -> str:
     return pf if pf == "none" else f"{pf}{degree}"
 
 
-def simulate(trace, prefetcher=None, policy=None):
-    """Simulate (pc, addr, kind) tuples with one `prefetcher`, or a per-PC `policy` {pc: prefetcher}.
+class Single:
+    """Policy that sends every read to one prefetcher."""
+
+    def __init__(self, prefetcher):
+        self.r = None if isinstance(prefetcher, NoPrefetcher) else (prefetcher, None)
+
+    def route(self, pc):
+        return self.r
+
+
+REUSE_WINDOW = 128  # a hit counts as reuse only if this many accesses after the fill
+
+
+def simulate(trace, prefetcher=None, policy=None, nontemporal=None, track_reuse=False):
+    """Simulate (pc, addr, kind) tuples.
+
+    prefetcher   one prefetcher for every read, or
+    policy       object with route(pc) -> (prefetcher, degree) | None,
+                 and optionally observe(pc, wait) for online learning
+    nontemporal  PCs whose fills go in at LRU and are not promoted on hits
+    track_reuse  also return {pc: [fills, reused]} in summary["reuse"]
 
     Returns (per_pc {pc: [reads, wait_cycles, l1_misses]}, summary dict).
     """
-    if prefetcher is None and policy is None:
-        prefetcher = NoPrefetcher()
+    if policy is None:
+        policy = Single(prefetcher or NoPrefetcher())
+    route = policy.route
+    observe = getattr(policy, "observe", None)
+    nt_pcs = nontemporal or set()
 
     l1 = Cache(L1_SIZE, L1_WAYS)
     l2 = Cache(L2_SIZE, L2_WAYS)
     ready = {}         # line -> cycle its in-flight fetch completes
     pf_unused = set()  # prefetched lines not yet used
+    nt_lines = set()   # L1 lines filled by a non-temporal load
+    owner = {}         # line -> [pc, fill index, reused]  (track_reuse)
+    reuse = {}
     per_pc = {}
-    now = 0
+    now = idx = 0
     issued = useful = late = 0
 
+    def evict(victim):
+        ready.pop(victim, None)
+        pf_unused.discard(victim)
+        nt_lines.discard(victim)
+        if track_reuse:
+            o = owner.pop(victim, None)
+            if o is not None:
+                st = reuse.setdefault(o[0], [0, 0])
+                st[0] += 1
+                st[1] += o[2]
+
     for pc, addr, kind in trace:
+        idx += 1
         line = addr >> LINE_BITS
+        if track_reuse:
+            o = owner.get(line)
+            if o is not None and not o[2] and idx - o[1] > REUSE_WINDOW:
+                o[2] = 1
+
         if kind == 1:  # store
-            if not l1.touch(line):
+            if not l1.touch(line, line not in nt_lines):
                 if not l2.touch(line):
                     l2.insert(line)
                 victim = l1.insert(line)
                 if victim is not None:
-                    ready.pop(victim, None)
-                    pf_unused.discard(victim)
+                    evict(victim)
             now += GAP
             continue
 
         # Demand read (load or modify)
-        if l1.touch(line):
+        if l1.touch(line, line not in nt_lines):
             wait = L1_LAT
             r = ready.get(line)
             if r is not None:
@@ -206,15 +247,19 @@ def simulate(trace, prefetcher=None, policy=None):
                 pf_unused.discard(line)
             miss = 0
         else:
+            nt = pc in nt_pcs
             if l2.touch(line):
                 wait = L2_LAT
             else:
                 wait = DRAM_LAT
-                l2.insert(line)
-            victim = l1.insert(line)
+                l2.insert(line, nt)
+            victim = l1.insert(line, nt)
             if victim is not None:
-                ready.pop(victim, None)
-                pf_unused.discard(victim)
+                evict(victim)
+            if nt:
+                nt_lines.add(line)
+            if track_reuse:
+                owner[line] = [pc, idx, 0]
             miss = 1
 
         s = per_pc.get(pc)
@@ -226,10 +271,13 @@ def simulate(trace, prefetcher=None, policy=None):
             s[2] += miss
         now += wait + GAP
 
-        pf = prefetcher if policy is None else policy.get(pc)
-        if pf is None:
+        if observe is not None:
+            observe(pc, wait)
+        r = route(pc)
+        if r is None:
             continue
-        for pl in pf.train(pc, addr, line):
+        pf, degree = r
+        for pl in pf.train(pc, addr, line, degree):
             if pl < 0 or l1.contains(pl):
                 continue
             if l2.touch(pl):
@@ -239,10 +287,15 @@ def simulate(trace, prefetcher=None, policy=None):
                 l2.insert(pl)
             victim = l1.insert(pl)
             if victim is not None:
-                ready.pop(victim, None)
-                pf_unused.discard(victim)
+                evict(victim)
             pf_unused.add(pl)
             issued += 1
+
+    if track_reuse:
+        for o in owner.values():  # lines still resident at the end
+            st = reuse.setdefault(o[0], [0, 0])
+            st[0] += 1
+            st[1] += o[2]
 
     reads = sum(s[0] for s in per_pc.values())
     total_wait = sum(s[1] for s in per_pc.values())
@@ -256,5 +309,6 @@ def simulate(trace, prefetcher=None, policy=None):
         "pf_late": late,
         "pf_accuracy": useful / issued if issued else 0.0,
         "cycles": now,
+        "reuse": reuse,
     }
     return per_pc, summary
