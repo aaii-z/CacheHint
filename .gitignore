@@ -1,0 +1,6 @@
+build/
+data/
+__pycache__/
+*.pyc
+# third-party papers: keep locally, don't redistribute
+*.pdf
