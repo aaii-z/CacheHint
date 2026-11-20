@@ -15,7 +15,8 @@ from .config import OPT_LEVELS, RESULTS_DIR
 from .hints import HINT_DIR, MODELS
 
 
-def main() -> None:
+def analyse():
+    """Returns (per-line rows, summary {same_best, one_fits_all, n, consistent: {model: count}})."""
     by_line = defaultdict(dict)  # (workload, src) -> opt -> [rows that matter]
     for opt in OPT_LEVELS:
         with open(RESULTS_DIR / f"labels_{opt}.csv") as f:
@@ -31,26 +32,32 @@ def main() -> None:
                            for r in map(json.loads, path.read_text().splitlines())}
 
     lines = {k: v for k, v in by_line.items() if len(v) >= 2}
-    same_best = one_fits_all = 0
-    consistent = defaultdict(int)
-    print(f"{'workload':14s} {'source':20s}" + "".join(f"{o:>10s}" for o in OPT_LEVELS) + "  one hint fits all?")
+    rows = []
+    summary = {"n": len(lines), "same_best": 0, "one_fits_all": 0, "consistent": dict.fromkeys(hints, 0)}
     for (w, src), per_opt in sorted(lines.items()):
         best = {o: "/".join(sorted({r["label_pf"] for r in rs})) for o, rs in per_opt.items()}
         ok_sets = [set.union(*(set(r["acceptable_pf"].split()) for r in rs)) for rs in per_opt.values()]
         fits = bool(set.intersection(*ok_sets))
-        same_best += len(set(best.values())) == 1
-        one_fits_all += fits
-        print(f"{w:14s} {src:20s}" + "".join(f"{best.get(o, '-'):>10s}" for o in OPT_LEVELS)
-              + f"  {'yes' if fits else 'NO'}")
+        summary["same_best"] += len(set(best.values())) == 1
+        summary["one_fits_all"] += fits
+        rows.append((w, src, best, fits))
         for name, h in hints.items():
             given = {h.get((o, r["kernel"], r["pc"])) for o, rs in per_opt.items() for r in rs}
-            consistent[name] += len(given) == 1
+            summary["consistent"][name] += len(given) == 1
+    return rows, summary
 
-    n = len(lines)
+
+def main() -> None:
+    rows, s = analyse()
+    print(f"{'workload':14s} {'source':20s}" + "".join(f"{o:>10s}" for o in OPT_LEVELS) + "  one hint fits all?")
+    for w, src, best, fits in rows:
+        print(f"{w:14s} {src:20s}" + "".join(f"{best.get(o, '-'):>10s}" for o in OPT_LEVELS)
+              + f"  {'yes' if fits else 'NO'}")
+    n = s["n"]
     print(f"\n{n} source lines with a load that matters at 2+ opt levels")
-    print(f"  same best prefetcher at every level: {same_best}/{n}")
-    print(f"  one hint near-best at every level:   {one_fits_all}/{n}")
-    for name, c in consistent.items():
+    print(f"  same best prefetcher at every level: {s['same_best']}/{n}")
+    print(f"  one hint near-best at every level:   {s['one_fits_all']}/{n}")
+    for name, c in s["consistent"].items():
         print(f"  {name:22s} same hint at every level: {c}/{n}")
 
 

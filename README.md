@@ -55,6 +55,14 @@ Absolute speedups are inflated by the blocking core; compare rows, not to real C
 - Compiler sensitivity: best prefetcher per source line is the same at all opt levels for 15/19 lines; LLM hints for the same line agree for only 10-12/19.
 - Replacement (non-temporal) hint: within ±5%; hurts `binsearch`, where one instruction touches both hot and cold lines.
 
+**Plots** (`results/plots/`, made by `python3 -m cachehint.plot`)
+
+![Whole-program speedup](results/plots/speedup.png)
+![Per-load hint quality](results/plots/accuracy.png)
+![Per-workload speedup at -O2](results/plots/heatmap_O2.png)
+![Input and compiler sensitivity](results/plots/sensitivity.png)
+![Replacement hint](results/plots/replacement.png)
+
 ## Run
 
 ```sh
@@ -68,6 +76,7 @@ python3 -m cachehint.score
 python3 -m cachehint.evaluate         # whole-program speedups
 python3 -m cachehint.compiler         # compiler sensitivity
 python3 -m cachehint.replacement      # non-temporal hint
+python3 -m cachehint.plot             # plots into results/plots/
 ```
 
 Validation (O2): L1 read misses match cachegrind within 0.8% on all workloads.
